@@ -1,314 +1,321 @@
-﻿import os
-import json
-import asyncio
-from datetime import datetime
-from dotenv import load_dotenv
+import os
+import logging
+from telegram import Update, ReplyKeyboardMarkup, KeyboardButton
+from telegram.ext import (
+    Application, CommandHandler, MessageHandler,
+    filters, ContextTypes, ConversationHandler
+)
+from database import (
+    get_user, update_user, add_diary_entry,
+    update_streak, get_week_diary
+)
+from gemini import chat_with_gemini, generate_weekly_report, generate_motivation_quote
+from scheduler import setup_scheduler
 
-import google.generativeai as genai
-from aiogram import Bot, Dispatcher, types
-from aiogram.filters import Command
-from apscheduler.schedulers.asyncio import AsyncIOScheduler
+BOT_TOKEN = os.getenv("BOT_TOKEN", "ВАШ_ТОКЕН")
+RENDER_URL = os.getenv("RENDER_URL", "")  # https://trainer-bot.onrender.com
 
-load_dotenv()
+logging.basicConfig(format="%(asctime)s - %(levelname)s - %(message)s", level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-TOKEN = os.getenv("TELEGRAM_TOKEN")
-GEMINI_KEY = os.getenv("GEMINI_API_KEY")
-OWNER_ID = os.getenv("OWNER_ID")  # добавь в .env свой Telegram ID
+WAITING_MOOD, WAITING_ENERGY, WAITING_NOTES = 1, 2, 3
 
-genai.configure(api_key=GEMINI_KEY)
+CRISIS_WORDS = [
+    "всё плохо", "все плохо", "устал", "не могу", "сдаюсь",
+    "депрессия", "грустно", "тяжело", "хочу всё бросить",
+    "нет сил", "опустились руки", "расстроен", "не получается",
+    "ничего не хочу", "всё надоело", "бросить всё"
+]
 
-# ==================== СИСТЕМНЫЙ ПРОМПТ ====================
-SYSTEM_PROMPT = """Ты — Брофорс. Не ассистент, не бот — живой собеседник и личный коуч.
+def main_menu():
+    keyboard = [
+        [KeyboardButton("✅ Задание выполнено"), KeyboardButton("📓 Дневник")],
+        [KeyboardButton("📊 Статистика"), KeyboardButton("💊 Показатели здоровья")],
+        [KeyboardButton("🔥 Мой стрик"), KeyboardButton("📈 Отчёт за неделю")],
+        [KeyboardButton("💬 Просто поговорить"), KeyboardButton("💡 Мотивация")],
+    ]
+    return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
 
-Характер:
-- Дерзкий, прямой, без соплей. Говоришь как старший брат который видел жизнь.
-- Можешь подколоть, поржать, но всегда на своей стороне.
-- Никаких "конечно!", "отличный вопрос!", "я понимаю твои чувства" — это бесит.
-- Не используешь эмодзи без причины. Максимум 1-2 если уместно.
-- Короткие ответы когда ситуация простая. Развёрнутые когда реально нужно.
-- Матом не злоупотребляешь, но лёгкий стёб и резкость — норма.
-
-Как общаешься:
-- Запоминаешь что говорил человек раньше в диалоге, отсылаешься к этому.
-- Если человек ноет — сочувствуешь ровно 1 раз, потом переводишь в действие.
-- Если человек молодец — признаёшь без пафоса.
-- Задаёшь вопросы когда тебе реально интересно или нужно понять ситуацию.
-- Даёшь конкретные советы, не воду.
-
-Задания:
-- Когда просят задание — придумываешь одно конкретное, выполнимое за день.
-- Не повторяешь одни и те же задания. Разнообразь.
-- Задание под человека, не шаблон из интернета.
-
-Запрещено:
-- Говорить "как ИИ я...", "я языковая модель...", "мои ограничения..."
-- Писать списками когда это не нужно
-- Быть вежливым до тошноты
-- Игнорировать контекст предыдущих сообщений"""
-
-# ==================== ХРАНИЛИЩЕ ====================
-DATA_FILE = "user_data.json"
-
-def load_data() -> dict:
-    try:
-        with open(DATA_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
-        return {}
-
-def save_data(data: dict):
-    with open(DATA_FILE, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
-
-def get_user(data: dict, user_id: int) -> dict:
-    uid = str(user_id)
-    if uid not in data:
-        data[uid] = {
-            "history": [],       # история диалога для Gemini
-            "mood": "",
-            "last_task": "",
-            "done": 0,
-            "total": 0,
-            "name": ""
-        }
-    return data[uid]
-
-# ==================== GEMINI С ИСТОРИЕЙ ====================
-MAX_HISTORY = 30  # максимум сообщений в истории (15 пар)
-
-def build_gemini_history(history: list) -> list:
-    """
-    Конвертируем нашу историю в формат Gemini.
-    history = [{"role": "user"/"model", "text": "..."}]
-    """
-    result = []
-    for msg in history:
-        result.append({
-            "role": msg["role"],
-            "parts": [{"text": msg["text"]}]
-        })
-    return result
-
-async def ask_gemini(user_record: dict, user_message: str) -> str:
-    """
-    Отправляем сообщение в Gemini с полной историей диалога.
-    Gemini поддерживает multi-turn через chat.history.
-    """
-    history = user_record.get("history", [])
-
-    # Добавляем контекст о пользователе в первое сообщение системы
-    context_note = ""
-    if user_record.get("mood"):
-        context_note += f"[Настроение юзера: {user_record['mood']}] "
-    if user_record.get("last_task"):
-        context_note += f"[Последнее задание: {user_record['last_task']}] "
-    if user_record.get("done") or user_record.get("total"):
-        context_note += f"[Выполнено заданий: {user_record['done']}/{user_record['total']}] "
-    if user_record.get("name"):
-        context_note += f"[Имя: {user_record['name']}] "
-
-    full_message = f"{context_note}\n{user_message}".strip() if context_note else user_message
-
-    # Инициализируем модель
-    gemini_model = genai.GenerativeModel(
-        model_name="gemini-2.5-flash",
-        system_instruction=SYSTEM_PROMPT
-    )
-
-    # Создаём чат с историей
-    chat = gemini_model.start_chat(
-        history=build_gemini_history(history)
-    )
-
-    # Отправляем сообщение
-    response = await asyncio.to_thread(
-        chat.send_message,
-        full_message
-    )
-
-    reply = response.text.strip()
-
-    # Сохраняем в историю
-    history.append({"role": "user", "text": user_message})
-    history.append({"role": "model", "text": reply})
-
-    # Обрезаем историю если слишком длинная
-    if len(history) > MAX_HISTORY:
-        history = history[-MAX_HISTORY:]
-
-    user_record["history"] = history
-
-    return reply
-
-# ==================== БОТ ====================
-bot = Bot(token=TOKEN)
-dp = Dispatcher()
-scheduler = AsyncIOScheduler()
-app_data = load_data()
-
-# ==================== РАСПИСАНИЕ ====================
-async def morning_message():
-    if OWNER_ID:
-        await bot.send_message(
-            chat_id=int(OWNER_ID),
-            text="Подъём. Новый день, чистый лист. Как себя чувствуешь?"
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    name = update.effective_user.first_name or "Чемпион"
+    get_user(user_id)
+    update_user(user_id, {"name": name})
+    welcome = await chat_with_gemini(
+        user_id, f"Привет! Меня зовут {name}.",
+        extra_context=(
+            "Первый запуск. Поприветствуй тепло и по-дружески. "
+            "Ты — Макс, личный тренер и друг. "
+            "Кратко: задания в 7:00, чекин в 21:00, дневник, аналитика. "
+            "Спроси главную цель на месяц. Будь живым!"
         )
+    )
+    await update.message.reply_text(f"👋 {welcome}", reply_markup=main_menu())
 
-async def evening_check():
-    if OWNER_ID:
-        uid = str(OWNER_ID)
-        task = ""
-        if uid in app_data and app_data[uid].get("last_task"):
-            task = f'Задание было: "{app_data[uid]["last_task"][:80]}..." — сделал?'
-        else:
-            task = "Чем сегодня занимался? Есть что рассказать?"
-        await bot.send_message(chat_id=int(OWNER_ID), text=f"21:00. {task}")
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = (
+        "🤖 *Что умеет Макс:*\n\n"
+        "☀️ 7:00 — задание на день\n"
+        "💧 12:00 и 15:00 — напоминание о воде\n"
+        "🌙 21:00 — вечерний чекин\n"
+        "📊 Вс 20:00 — отчёт за неделю\n\n"
+        "*Команды:*\n"
+        "`/mood 7` — быстрая оценка настроения\n"
+        "`/goal` — поставить новую цель\n"
+        "`/cancel` — отменить действие\n\n"
+        "*Лайфхаки:*\n"
+        "Напиши `вес 80`, `пульс 62`, `сон 7` — сохранится автоматически\n"
+        "Плохо на душе — просто напиши, Макс поймёт 🤝"
+    )
+    await update.message.reply_text(text, parse_mode="Markdown")
 
-# ==================== КОМАНДЫ ====================
-@dp.message(Command("start"))
-async def cmd_start(message: types.Message):
-    uid = message.from_user.id
-    user = get_user(app_data, uid)
+async def quick_mood(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    args = context.args
+    if not args or not args[0].isdigit():
+        await update.message.reply_text("Пример: `/mood 7`", parse_mode="Markdown")
+        return
+    mood = int(args[0])
+    if not 1 <= mood <= 10:
+        await update.message.reply_text("Цифра от 1 до 10")
+        return
+    add_diary_entry(user_id, {"mood": mood, "energy": None, "notes": "быстрая оценка"})
+    level = "низкое 😔" if mood <= 4 else "среднее 😐" if mood <= 6 else "хорошее 😊"
+    extra = f"Пользователь быстро оценил настроение: {mood}/10 ({level}). Коротко отреагируй — 1 предложение."
+    response = await chat_with_gemini(user_id, f"Настроение {mood}/10", extra_context=extra)
+    await update.message.reply_text(response, reply_markup=main_menu())
 
-    # Запоминаем имя
-    name = message.from_user.first_name or "братан"
-    user["name"] = name
-    save_data(app_data)
+async def set_goal(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    response = await chat_with_gemini(
+        user_id, "Хочу поставить новую цель",
+        extra_context="Пользователь хочет поставить или обновить цель. Спроси что именно он хочет достичь, за какой срок, и что мешало раньше. Задай 1-2 вопроса."
+    )
+    await update.message.reply_text(response, reply_markup=main_menu())
 
-    await message.answer(
-        f"О, {name} появился. Я Брофорс — твой личный коуч и собеседник.\n"
-        "Пиши что угодно. Без церемоний."
+async def handle_task_done(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    streak = update_streak(user_id, done=True)
+    milestones = {7: "Неделя без пропусков 🎯", 14: "Две недели огня 🔥", 30: "Месяц дисциплины 🏆", 100: "100 дней — легенда 👑"}
+    milestone_text = f"\n\n🏆 *{milestones[streak]}* — это реально круто!" if streak in milestones else ""
+    extra = (
+        f"Пользователь выполнил задание! Стрик: {streak} дней подряд. "
+        f"Похвали искренне, по-дружески, без занудства. "
+        f"{'Особо отметь веху ' + str(streak) + ' дней!' if streak in milestones else ''}"
+    )
+    response = await chat_with_gemini(user_id, "Я выполнил задание!", extra_context=extra)
+    fires = "🔥" * min(streak // 7 + 1, 5)
+    await update.message.reply_text(
+        f"{response}{milestone_text}\n\n{fires} Стрик: *{streak} дней!*",
+        parse_mode="Markdown", reply_markup=main_menu()
     )
 
-@dp.message(Command("reset"))
-async def cmd_reset(message: types.Message):
-    uid = message.from_user.id
-    uid_str = str(uid)
-    if uid_str in app_data:
-        app_data[uid_str]["history"] = []
-        save_data(app_data)
-    await message.answer("История чата сброшена. Начинаем с нуля.")
+async def handle_streak(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    user = get_user(user_id)
+    streak = user.get("streak", 0)
+    last_done = user.get("last_task_done", "—")
+    if streak == 0:
+        text = "🔥 Стрик: 0 дней\n\nНачни сегодня — выполни задание! 💪"
+    elif streak < 7:
+        text = f"🔥 Стрик: *{streak} дней!*\nПоследнее: {last_done}\nДо недели: {7 - streak} дней"
+    elif streak < 30:
+        text = f"🔥🔥 Стрик: *{streak} дней!*\nПоследнее: {last_done}\nСерьёзный результат!"
+    else:
+        text = f"🔥🔥🔥 СТРИК: *{streak} ДНЕЙ!*\nЭто уже образ жизни 🚀"
+    await update.message.reply_text(text, parse_mode="Markdown", reply_markup=main_menu())
 
-@dp.message(Command("stats"))
-async def cmd_stats(message: types.Message):
-    uid = message.from_user.id
-    user = get_user(app_data, uid)
-    done = user.get("done", 0)
-    total = user.get("total", 0)
-    last = user.get("last_task", "нет") or "нет"
-    await message.answer(
-        f"📊 Твоя статистика:\n"
-        f"Выполнено заданий: {done}/{total}\n"
-        f"Последнее: {last[:100]}"
+async def handle_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    user = get_user(user_id)
+    diary = get_week_diary(user_id)
+    streak = user.get("streak", 0)
+    health = user.get("health_data", {})
+    moods = [e.get("mood") for e in diary if e.get("mood")]
+    energies = [e.get("energy") for e in diary if e.get("energy")]
+    avg_mood = round(sum(moods) / len(moods), 1) if moods else "—"
+    avg_energy = round(sum(energies) / len(energies), 1) if energies else "—"
+    text = (
+        f"📊 *Твоя статистика*\n\n"
+        f"🔥 Стрик: {streak} дней подряд\n"
+        f"😊 Среднее настроение (7 дней): {avg_mood}/10\n"
+        f"⚡ Средняя энергия (7 дней): {avg_energy}/10\n"
+        f"⚖️ Вес: {health.get('weight', 'не указан')}\n"
+        f"📅 Записей в дневнике: {len(user.get('diary', []))}\n"
     )
+    await update.message.reply_text(text, parse_mode="Markdown", reply_markup=main_menu())
 
-@dp.message(Command("task"))
-async def cmd_task(message: types.Message):
-    uid = message.from_user.id
-    user = get_user(app_data, uid)
-
-    # Принудительно запрашиваем задание
-    task_prompt = (
-        "Дай мне одно конкретное задание на сегодня. "
-        "Учти мой контекст если он есть. Одно задание, не список."
-    )
-    try:
-        reply = await ask_gemini(user, task_prompt)
-        user["last_task"] = reply[:150]
-        user["total"] += 1
-        save_data(app_data)
-        await message.answer(reply)
-    except Exception as e:
-        await message.answer("Что-то пошло не так с заданием. Попробуй ещё раз.")
-
-@dp.message(Command("done"))
-async def cmd_done(message: types.Message):
-    uid = message.from_user.id
-    user = get_user(app_data, uid)
-    user["done"] += 1
-    save_data(app_data)
-
-    try:
-        reply = await ask_gemini(
-            user,
-            f"Я выполнил задание! Всего выполнено {user['done']} заданий."
+async def handle_health(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    health = get_user(user_id).get("health_data", {})
+    if not health:
+        text = (
+            "💊 *Показатели здоровья*\n\nПока ничего нет.\n\n"
+            "Просто напиши:\n`вес 78` / `пульс 62` / `давление 120/80` / `сон 7`"
         )
-        await message.answer(reply)
-    except Exception:
-        await message.answer(f"Красавчик. {user['done']} заданий в копилке.")
+    else:
+        emoji_map = {"weight": "⚖️ Вес", "pulse": "❤️ Пульс", "pressure": "🩺 Давление", "sleep": "😴 Сон"}
+        lines = ["💊 *Мои показатели:*\n"]
+        for k, v in health.items():
+            lines.append(f"{emoji_map.get(k, k)}: {v}")
+        text = "\n".join(lines)
+    await update.message.reply_text(text, parse_mode="Markdown", reply_markup=main_menu())
 
-# ==================== ГЛАВНЫЙ ОБРАБОТЧИК ====================
-@dp.message()
-async def handle_message(message: types.Message):
-    if not message.text:
-        await message.answer("Голосовые и файлы пока не понимаю. Пиши текстом.")
+async def handle_weekly_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    await update.message.reply_text("⏳ Генерирую отчёт за неделю...")
+    report = generate_weekly_report(user_id)
+    await update.message.reply_text(report, parse_mode="Markdown", reply_markup=main_menu())
+
+async def handle_motivation(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    await update.message.reply_text("⚡ Сейчас зарядим...")
+    quote = await generate_motivation_quote(user_id)
+    await update.message.reply_text(quote, reply_markup=main_menu())
+
+async def handle_talk(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    response = await chat_with_gemini(
+        user_id, "Хочу просто поговорить",
+        extra_context="Пользователь хочет поговорить. Спроси как дела, что на душе. Будь как настоящий друг."
+    )
+    await update.message.reply_text(response, reply_markup=main_menu())
+
+# ——— ДНЕВНИК ———
+async def start_diary(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "📓 *Дневник*\n\nОцени настроение от 1 до 10:\n1-3 😔  4-6 😐  7-10 😊",
+        parse_mode="Markdown"
+    )
+    return WAITING_MOOD
+
+async def diary_mood(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        mood = int(update.message.text.strip())
+        if not 1 <= mood <= 10: raise ValueError
+        context.user_data["diary_mood"] = mood
+        await update.message.reply_text("⚡ Уровень энергии от 1 до 10:\n1-3 🥱  4-6 ⚡  7-10 🚀")
+        return WAITING_ENERGY
+    except ValueError:
+        await update.message.reply_text("Число от 1 до 10:")
+        return WAITING_MOOD
+
+async def diary_energy(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        energy = int(update.message.text.strip())
+        if not 1 <= energy <= 10: raise ValueError
+        context.user_data["diary_energy"] = energy
+        await update.message.reply_text("✍️ Заметка (что случилось, как тренировка)?\nИли «-» чтобы пропустить:")
+        return WAITING_NOTES
+    except ValueError:
+        await update.message.reply_text("Число от 1 до 10:")
+        return WAITING_ENERGY
+
+async def diary_notes(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    notes = update.message.text.strip()
+    if notes == "-": notes = ""
+    mood = context.user_data.get("diary_mood")
+    energy = context.user_data.get("diary_energy")
+    add_diary_entry(user_id, {"mood": mood, "energy": energy, "notes": notes})
+    extra = (
+        f"Записал в дневник: настроение {mood}/10, энергия {energy}/10"
+        f"{', заметка: ' + notes if notes else ''}. "
+        f"Коротко отреагируй как друг — 1-2 предложения."
+    )
+    response = await chat_with_gemini(user_id, "Записал в дневник", extra_context=extra)
+    await update.message.reply_text(f"✅ Записано!\n\n{response}", reply_markup=main_menu())
+    return ConversationHandler.END
+
+async def cancel_diary(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Отменено.", reply_markup=main_menu())
+    return ConversationHandler.END
+
+# ——— Парсинг данных здоровья ———
+def parse_health_data(text: str) -> dict:
+    import re
+    data = {}
+    t = text.lower()
+    if m := re.search(r'вес[:\s]+(\d+[\.,]?\d*)', t): data["weight"] = m.group(1) + " кг"
+    if m := re.search(r'пульс[:\s]+(\d+)', t): data["pulse"] = m.group(1) + " уд/мин"
+    if m := re.search(r'сон[:\s]+(\d+[\.,]?\d*)', t): data["sleep"] = m.group(1) + " ч"
+    if m := re.search(r'давлени[еяю][:\s]+(\d+/\d+)', t): data["pressure"] = m.group(1)
+    return data
+
+def is_crisis_message(text: str) -> bool:
+    return any(w in text.lower() for w in CRISIS_WORDS)
+
+# ——— ГЛАВНЫЙ ОБРАБОТЧИК ———
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    text = update.message.text
+
+    button_map = {
+        "✅ Задание выполнено": handle_task_done,
+        "📊 Статистика": handle_stats,
+        "💊 Показатели здоровья": handle_health,
+        "🔥 Мой стрик": handle_streak,
+        "📈 Отчёт за неделю": handle_weekly_report,
+        "💡 Мотивация": handle_motivation,
+        "💬 Просто поговорить": handle_talk,
+    }
+    if text in button_map:
+        await button_map[text](update, context)
         return
 
-    uid = message.from_user.id
-    user = get_user(app_data, uid)
+    health_data = parse_health_data(text)
+    if health_data:
+        existing = get_user(user_id).get("health_data", {})
+        existing.update(health_data)
+        update_user(user_id, {"health_data": existing})
 
-    # Обновляем имя если не было
-    if not user.get("name") and message.from_user.first_name:
-        user["name"] = message.from_user.first_name
+    extra = ""
+    if is_crisis_message(text):
+        extra = (
+            "ВАЖНО: пользователь в подавленном состоянии. "
+            "Сначала только выслушай и поддержи — никаких советов. "
+            "Дай понять что ты рядом и что это нормально. "
+            "Тон: тёплый, живой, как лучший друг."
+        )
+    elif health_data:
+        extra = f"Пользователь поделился данными о здоровье: {health_data}. Прокомментируй коротко."
 
-    user_input = message.text
+    response = await chat_with_gemini(user_id, text, extra_context=extra)
+    await update.message.reply_text(response, reply_markup=main_menu())
 
-    # Обновляем настроение по ключевым словам
-    mood_keywords = ["настроение", "чувствую себя", "сегодня мне", "немного", "устал", "рад", "злой", "грустно"]
-    if any(kw in user_input.lower() for kw in mood_keywords):
-        user["mood"] = user_input[:120]
+# ——— ЗАПУСК ———
+def main():
+    app = Application.builder().token(BOT_TOKEN).build()
 
-    # Отслеживаем упоминание задания
-    task_keywords = ["задание", "task", "дай задание", "что делать", "что сделать", "придумай задание"]
-    is_task_request = any(kw in user_input.lower() for kw in task_keywords)
+    diary_conv = ConversationHandler(
+        entry_points=[MessageHandler(filters.Regex("^📓 Дневник$"), start_diary)],
+        states={
+            WAITING_MOOD: [MessageHandler(filters.TEXT & ~filters.COMMAND, diary_mood)],
+            WAITING_ENERGY: [MessageHandler(filters.TEXT & ~filters.COMMAND, diary_energy)],
+            WAITING_NOTES: [MessageHandler(filters.TEXT & ~filters.COMMAND, diary_notes)],
+        },
+        fallbacks=[CommandHandler("cancel", cancel_diary)]
+    )
 
-    # Отслеживаем выполнение задания
-    done_keywords = ["сделал задание", "выполнил задание", "задание сделано", "задание выполнено"]
-    is_done = any(kw in user_input.lower() for kw in done_keywords)
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("help", help_command))
+    app.add_handler(CommandHandler("mood", quick_mood))
+    app.add_handler(CommandHandler("goal", set_goal))
+    app.add_handler(diary_conv)
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
-    try:
-        # Показываем что печатаем (UX)
-        await bot.send_chat_action(message.chat.id, "typing")
+    setup_scheduler(app, app.bot)
 
-        reply = await ask_gemini(user, user_input)
-
-        # Если просил задание — сохраняем его
-        if is_task_request:
-            user["last_task"] = reply[:150]
-            user["total"] += 1
-
-        # Если отметил выполнение
-        if is_done:
-            user["done"] += 1
-
-        save_data(app_data)
-        await message.answer(reply)
-
-    except Exception as e:
-        print(f"Gemini error: {e}")
-        # Пробуем простой fallback без истории
-        try:
-            simple_model = genai.GenerativeModel(
-                model_name="gemini-2.5-flash",
-                system_instruction=SYSTEM_PROMPT
-            )
-            resp = await asyncio.to_thread(
-                simple_model.generate_content,
-                user_input
-            )
-            await message.answer(resp.text.strip())
-        except Exception as e2:
-            print(f"Fallback error: {e2}")
-            await message.answer("Что-то сломалось на моей стороне. Попробуй ещё раз через секунду.")
-
-# ==================== ЗАПУСК ====================
-async def main():
-    scheduler.add_job(morning_message, "cron", hour=7, minute=30)
-    scheduler.add_job(evening_check, "cron", hour=21, minute=0)
-    scheduler.start()
-
-    print("✅ Брофорс запущен")
-    await dp.start_polling(bot)
+    if RENDER_URL:
+        logger.info("Webhook режим")
+        app.run_webhook(
+            listen="0.0.0.0",
+            port=int(os.environ.get("PORT", 10000)),
+            webhook_url=f"{RENDER_URL}/webhook"
+        )
+    else:
+        logger.info("Polling режим (локально)")
+        app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
